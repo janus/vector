@@ -21,7 +21,6 @@ import {
   IExternalValidation,
   AUTODEPLOY_CHAIN_IDS,
 } from "@connext/vector-types";
-import { Wallet } from "@ethersproject/wallet";
 import pino from "pino";
 import Ajv from "ajv";
 import { Evt } from "evt";
@@ -574,6 +573,122 @@ export class VectorEngine implements IVectorEngine {
       return Result.ok(sig);
     } catch (e) {
       return Result.fail(e);
+    }
+  }
+
+  private async crossChainTransfer() {
+    const senderChannelRes = await this.getStateChannelByParticipants({
+      counterparty: this.routerPublicIdentifier!,
+      chainId: params.fromChainId,
+    });
+    if (senderChannelRes.isError) {
+      throw senderChannelRes.getError();
+    }
+    const receiverChannelRes = await this.getStateChannelByParticipants({
+      counterparty: this.routerPublicIdentifier!,
+      chainId: params.toChainId,
+    });
+    if (receiverChannelRes.isError) {
+      throw receiverChannelRes.getError();
+    }
+    const senderChannel = senderChannelRes.getValue() as FullChannelState;
+    const receiverChannel = receiverChannelRes.getValue() as FullChannelState;
+    if (!senderChannel || !receiverChannel) {
+      throw new Error(
+        `Channel does not exist for chainId ${!senderChannel ? params.fromChainId : params.toChainId} with ${
+          this.routerPublicIdentifier
+        }`,
+      );
+    }
+
+    if (params.reconcileDeposit) {
+      this.logger.info(
+        { assetId: params.fromAssetId, channelAddress: senderChannel.channelAddress },
+        "Reconciling deposit",
+      );
+      const depositRes = await this.reconcileDeposit({
+        assetId: params.fromAssetId,
+        channelAddress: senderChannel.channelAddress,
+      });
+      if (depositRes.isError) {
+        throw depositRes.getError();
+      }
+      const updated = await this.getStateChannel({ channelAddress: senderChannel.channelAddress });
+      this.logger.info({ updated }, "Deposit reconciled");
+    }
+
+    const preImage = getRandomBytes32();
+    const lockHash = soliditySha256(["bytes32"], [preImage]);
+    this.logger.info({ preImage, lockHash }, "Sending cross-chain transfer");
+    const transferParams = {
+      amount: params.amount,
+      assetId: params.fromAssetId,
+      channelAddress: senderChannel.channelAddress,
+      details: {
+        lockHash,
+        expiry: "0",
+      },
+      type: TransferNames.HashlockTransfer,
+      recipient: this.publicIdentifier,
+      recipientAssetId: params.toAssetId,
+      recipientChainId: params.toChainId,
+      meta: { ...params, reason: "Cross-chain transfer" },
+    };
+    const transferRes = await this.conditionalTransfer(transferParams);
+    if (transferRes.isError) {
+      throw transferRes.getError();
+    }
+    const senderTransfer = transferRes.getValue();
+    this.logger.warn({ senderTransfer }, "Sender transfer successfully completed, waiting for receiver transfer...");
+    const receiverTransferData = await this.waitFor(EngineEvents.CONDITIONAL_TRANSFER_CREATED, 60000, (data) => {
+      if (
+        data.transfer.meta.routingId === senderTransfer.routingId &&
+        data.channelAddress === receiverChannel.channelAddress
+      ) {
+        return true;
+      }
+      return false;
+    });
+    if (!receiverTransferData) {
+      this.logger.error(
+        { routingId: senderTransfer.routingId, channelAddress: receiverChannel.channelAddress },
+        "Failed to get receiver event",
+      );
+      return;
+    }
+
+    this.logger.info({ receiverTransferData }, "Received receiver transfer, resolving...");
+    const resolveParams = {
+      channelAddress: receiverChannel.channelAddress,
+      transferId: receiverTransferData.transfer.transferId,
+      transferResolver: {
+        preImage,
+      },
+    };
+    const resolveRes = await this.resolveTransfer(resolveParams);
+    if (resolveRes.isError) {
+      throw resolveRes.getError();
+    }
+    const resolvedTransfer = resolveRes.getValue();
+    this.logger.info({ resolvedTransfer }, "Resolved receiver transfer");
+
+    if (params.withdrawalAddress) {
+      const withdrawalAmount = receiverTransferData.transfer.balance.amount[1];
+      this.logger.info(
+        { withdrawalAddress: params.withdrawalAddress, withdrawalAmount },
+        "Withdrawing to configured address",
+      );
+      const withdrawRes = await this.withdraw({
+        amount: withdrawalAmount, // bob is receiver
+        assetId: params.toAssetId,
+        channelAddress: receiverChannel.channelAddress,
+        recipient: params.withdrawalAddress,
+      });
+      if (withdrawRes.isError) {
+        throw withdrawRes.getError();
+      }
+      const withdrawal = withdrawRes.getValue();
+      this.logger.info({ withdrawal }, "Withdrawal completed");
     }
   }
 

@@ -37,6 +37,17 @@ export type BrowserNodeSignerConfig = {
   chainAddresses: ChainAddresses;
 };
 
+const CROSS_CHAIN_TRANSFER_STATES = {
+  BEGIN: "BEGIN",
+  START_DEPOSIT: "START_DEPOSIT",
+  START_CREATE_TRANSFER: "START_CREATE_TRANSFER",
+  WAIT_FOR_CREATE_TRANSFER: "WAIT_FOR_CREATE_TRANSFER",
+  START_RESOLVE_TRANSFER: "START_RESOLVE_TRANSFER",
+  WAIT_FOR_RESOLVE_TRANSFER: "WAIT_FOR_RESOLVE_TRANSFER",
+  START_WITHDRAW: "START_WITHDRAW",
+  SUCCESS: "SUCCESS",
+};
+
 export class BrowserNode implements INodeService {
   public channelProvider: IRpcChannelProvider | undefined;
   public publicIdentifier = "";
@@ -164,6 +175,11 @@ export class BrowserNode implements INodeService {
     reconcileDeposit?: boolean;
     withdrawalAddress?: string;
   }): Promise<void> {
+    let currentState: string = CROSS_CHAIN_TRANSFER_STATES.BEGIN;
+
+    const crossChainTransferId = getRandomBytes32();
+    this.logger.info({ crossChainTransferId, currentState }, "Started cross-chain transfer");
+
     const senderChannelRes = await this.getStateChannelByParticipants({
       counterparty: this.routerPublicIdentifier!,
       chainId: params.fromChainId,
@@ -189,6 +205,11 @@ export class BrowserNode implements INodeService {
     }
 
     if (params.reconcileDeposit) {
+      currentState = CROSS_CHAIN_TRANSFER_STATES.START_DEPOSIT;
+      this.logger.info(
+        { assetId: params.fromAssetId, channelAddress: senderChannel.channelAddress, currentState },
+        "Reconciling deposit",
+      );
       const depositRes = await this.reconcileDeposit({
         assetId: params.fromAssetId,
         channelAddress: senderChannel.channelAddress,
@@ -200,9 +221,11 @@ export class BrowserNode implements INodeService {
       this.logger.info({ updated }, "Deposit reconciled");
     }
 
+    currentState = CROSS_CHAIN_TRANSFER_STATES.START_CREATE_TRANSFER;
+
     const preImage = getRandomBytes32();
     const lockHash = soliditySha256(["bytes32"], [preImage]);
-    this.logger.info({ preImage, lockHash }, "Sending cross-chain transfer");
+    this.logger.info({ preImage, lockHash, currentState }, "Sending cross-chain transfer");
     const transferParams = {
       amount: params.amount,
       assetId: params.fromAssetId,
@@ -215,12 +238,14 @@ export class BrowserNode implements INodeService {
       recipient: this.publicIdentifier,
       recipientAssetId: params.toAssetId,
       recipientChainId: params.toChainId,
-      meta: { ...params, reason: "Cross-chain transfer" },
+      meta: { params, reason: "Cross-chain transfer", routingId: crossChainTransferId },
     };
     const transferRes = await this.conditionalTransfer(transferParams);
     if (transferRes.isError) {
       throw transferRes.getError();
     }
+
+    currentState = CROSS_CHAIN_TRANSFER_STATES.WAIT_FOR_CREATE_TRANSFER;
     const senderTransfer = transferRes.getValue();
     this.logger.warn({ senderTransfer }, "Sender transfer successfully completed, waiting for receiver transfer...");
     const receiverTransferData = await this.waitFor(EngineEvents.CONDITIONAL_TRANSFER_CREATED, 60000, (data) => {
@@ -239,6 +264,7 @@ export class BrowserNode implements INodeService {
       );
       return;
     }
+    currentState = CROSS_CHAIN_TRANSFER_STATES.START_RESOLVE_TRANSFER;
 
     this.logger.info({ receiverTransferData }, "Received receiver transfer, resolving...");
     const resolveParams = {
@@ -256,6 +282,7 @@ export class BrowserNode implements INodeService {
     this.logger.info({ resolvedTransfer }, "Resolved receiver transfer");
 
     if (params.withdrawalAddress) {
+      currentState = CROSS_CHAIN_TRANSFER_STATES.START_WITHDRAW;
       const withdrawalAmount = receiverTransferData.transfer.balance.amount[1];
       this.logger.info(
         { withdrawalAddress: params.withdrawalAddress, withdrawalAmount },
@@ -273,6 +300,8 @@ export class BrowserNode implements INodeService {
       const withdrawal = withdrawRes.getValue();
       this.logger.info({ withdrawal }, "Withdrawal completed");
     }
+
+    currentState = CROSS_CHAIN_TRANSFER_STATES.SUCCESS;
   }
   //////////////////
 

@@ -115,6 +115,17 @@ const WithdrawParamsSchema = Type.Object({
   meta: TBasicMeta,
 });
 
+// Cross Chain Transfer
+const CrossChainTransferParamsSchema = Type.Object({
+  amount: TIntegerString,
+  fromChainId: TChainId,
+  fromAssetId: TAddress,
+  toChainId: TChainId,
+  toAssetId: TAddress,
+  reconcileDeposit: Type.Optional(Type.Boolean),
+  withdrawalAddress: Type.Optional(TAddress),
+});
+
 //////////////////
 /// Dispute Methods
 
